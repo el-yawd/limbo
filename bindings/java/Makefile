@@ -5,6 +5,7 @@ CARGO_BUILD := cargo build --release
 
 MACOS_X86_DIR := $(RELEASE_DIR)/macos_x86
 MACOS_ARM64_DIR := $(RELEASE_DIR)/macos_arm64
+LINUX_X86_DIR := $(RELEASE_DIR)/linux_x86
 WINDOWS_DIR := $(RELEASE_DIR)/windows
 
 .PHONY: libs macos_x86 macos_arm64 windows lint lint_apply test build_test
@@ -16,6 +17,13 @@ macos_x86:
 	@mkdir -p $(TEMP_DIR) $(MACOS_X86_DIR)
 	@CARGO_TARGET_DIR=$(TEMP_DIR) $(CARGO_BUILD) --target x86_64-apple-darwin
 	@cp $(TEMP_DIR)/x86_64-apple-darwin/release/lib_limbo_java.dylib $(MACOS_X86_DIR)
+	@rm -rf $(TEMP_DIR)
+
+linux_x86:
+	@echo "Building release version for linux x86_64..."
+	@mkdir -p $(TEMP_DIR) $(LINUX_X86_DIR)
+	@CARGO_TARGET_DIR=$(TEMP_DIR) $(CARGO_BUILD) --target x86_64-unknown-linux-gnu
+	@cp $(TEMP_DIR)/x86_64-unknown-linux-gnu/release/lib_limbo_java.d $(LINUX_X86_DIR)
 	@rm -rf $(TEMP_DIR)
 
 macos_arm64:
