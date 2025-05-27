@@ -1,0 +1,3 @@
+[submodule "tests/sqlancer"]
+	path = tests/sqlancer
+	url = git@github.com:sqlancer/sqlancer
