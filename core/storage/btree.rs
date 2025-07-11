@@ -7010,8 +7010,8 @@ mod tests {
                 .unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
-                        crate::PagerCacheflushStatus::Done(_) => break,
-                        crate::PagerCacheflushStatus::IO => {
+                        crate::PagerCacheCommitStatus::Done(_) => break,
+                        crate::PagerCacheCommitStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
@@ -7137,8 +7137,8 @@ mod tests {
                 cursor.move_to_root().unwrap();
                 loop {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
-                        crate::PagerCacheflushStatus::Done(_) => break,
-                        crate::PagerCacheflushStatus::IO => {
+                        crate::PagerCacheCommitStatus::Done(_) => break,
+                        crate::PagerCacheCommitStatus::IO => {
                             pager.io.run_once().unwrap();
                         }
                     }
