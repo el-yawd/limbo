@@ -1,6 +1,7 @@
 use tracing::{instrument, Level};
 
 use crate::{
+    return_if_io,
     schema::Index,
     storage::{
         header_accessor,
@@ -110,16 +111,6 @@ pub const MAX_SIBLING_PAGES_TO_BALANCE: usize = 3;
 
 /// We only need maximum 5 pages to balance 3 pages, because we can guarantee that cells from 3 pages will fit in 5 pages.
 pub const MAX_NEW_SIBLING_PAGES_AFTER_BALANCE: usize = 5;
-
-/// Evaluate a Result<CursorResult<T>>, if IO return IO.
-macro_rules! return_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            CursorResult::Ok(v) => v,
-            CursorResult::IO => return Ok(CursorResult::IO),
-        }
-    };
-}
 
 /// Check if the page is unlocked, if not return IO.
 macro_rules! return_if_locked {

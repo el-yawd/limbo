@@ -2301,6 +2301,17 @@ pub enum CursorResult<T> {
     IO,
 }
 
+/// Evaluate a Result<CursorResult<T>>, if IO return IO.
+#[macro_export]
+macro_rules! return_if_io {
+    ($expr:expr) => {
+        match $expr? {
+            CursorResult::Ok(v) => v,
+            CursorResult::IO => return Ok(CursorResult::IO),
+        }
+    };
+}
+
 #[derive(Debug)]
 pub enum SeekResult {
     /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record

@@ -161,7 +161,7 @@ pub enum StepResult {
 /// If there is I/O, the instruction is restarted.
 /// Evaluate a Result<CursorResult<T>>, if IO return Ok(StepResult::IO).
 #[macro_export]
-macro_rules! return_if_io {
+macro_rules! return_step_if_io {
     ($expr:expr) => {
         match $expr? {
             CursorResult::Ok(v) => v,

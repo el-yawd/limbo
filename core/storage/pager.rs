@@ -1,5 +1,6 @@
 use crate::{
     result::LimboResult,
+    return_if_io,
     storage::{
         btree::{btree_init_page, BTreePage, BTreePageInner},
         buffer_pool::BufferPool,
@@ -621,8 +622,8 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> PageRef {
-        let page = self.allocate_page().unwrap();
+    pub fn allocate_overflow_page(&self) -> Result<CursorResult<PageRef>> {
+        let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
@@ -641,8 +642,8 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<BTreePage> {
-        let page = self.allocate_page()?;
+    ) -> Result<CursorResult<BTreePage>> {
+        let page = return_if_io!(self.allocate_page());
         let page = Arc::new(BTreePageInner {
             page: RefCell::new(page),
         });
@@ -652,7 +653,7 @@ impl Pager {
             page.get().get().id,
             page.get().get_contents().page_type()
         );
-        Ok(page)
+        Ok(CursorResult::Ok(page))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -854,13 +855,7 @@ impl Pager {
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self) -> Result<CursorResult<()>> {
-        let mut cache = self.page_cache.write();
-        let dirty_pages = self.dirty_pages.borrow();
-        let dirty_pages = dirty_pages
-                     .iter()
-                     .map(|key| cache.get(&PageCacheKey(*key)).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it."));
-
-        if let CursorResult::Ok(_) = self.stress(dirty_pages)? {
+        if let CursorResult::Ok(_) = self.stress(true)? {
             self.dirty_pages.borrow_mut().clear();
             return Ok(CursorResult::Ok(()));
         }
@@ -1235,7 +1230,7 @@ impl Pager {
     // FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn allocate_page(&self) -> Result<PageRef> {
+    pub fn allocate_page(&self) -> Result<CursorResult<PageRef>> {
         let old_db_size = header_accessor::get_database_size(self)?;
         #[allow(unused_mut)]
         let mut new_db_size = old_db_size + 1;
@@ -1258,7 +1253,10 @@ impl Pager {
                 let mut cache = self.page_cache.write();
                 match cache.insert(page_key, page.clone()) {
                     Ok(_) => (),
-                    Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                    Err(CacheError::Full) => {
+                        drop(cache);
+                        return_if_io!(self.stress(false));
+                    }
                     Err(_) => {
                         return Err(LimboError::InternalError(
                             "Unknown error inserting page to cache".into(),
@@ -1282,11 +1280,15 @@ impl Pager {
             let page_key = PageCacheKey(page.get().id);
             let mut cache = self.page_cache.write();
             match cache.insert(page_key, page.clone()) {
-                Err(CacheError::Full) => Err(LimboError::CacheFull),
+                Err(CacheError::Full) => {
+                    drop(cache);
+                    return_if_io!(self.stress(false));
+                    Ok(CursorResult::Ok(page))
+                }
                 Err(_) => Err(LimboError::InternalError(
                     "Unknown error inserting page to cache".into(),
                 )),
-                Ok(_) => Ok(page),
+                Ok(_) => Ok(CursorResult::Ok(page)),
             }
         }
     }
@@ -1342,10 +1344,7 @@ impl Pager {
     /// This function is called by the cache layer when it has reached some soft memory limit.
     /// The pager must be purgeable (not in-memory)
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn stress<T>(&self, pages: T) -> Result<CursorResult<()>>
-    where
-        T: Iterator<Item = PageRef>,
-    {
+    pub fn stress(&self, full: bool) -> Result<CursorResult<()>> {
         if !self.spill_flag.borrow().can_spill() {
             return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
         }
@@ -1355,7 +1354,18 @@ impl Pager {
 
         match state {
             FlushState::Start => {
-                for page in pages {
+                let mut page_cache = self.page_cache.write();
+                let page_ids: Vec<_> = self.dirty_pages.borrow().iter().copied().collect();
+                let mut dirty_pages = self.dirty_pages.borrow_mut();
+
+                for page_id in page_ids {
+                    let page = page_cache.get(&PageCacheKey(page_id)).expect(
+                        format!(
+                            "We somehow have a dirty page that isn't in the cache: page_id({})",
+                            page_id
+                        )
+                        .as_str(),
+                    );
                     assert!(page.is_dirty());
                     trace!("pager.stress(page={})", page.get().id);
                     self.wal.borrow_mut().append_frame(
@@ -1365,6 +1375,11 @@ impl Pager {
                     )?;
 
                     page.clear_dirty();
+                    page_cache.delete(PageCacheKey(page_id)).unwrap();
+                    dirty_pages.remove(&page_id);
+                    if !full {
+                        break;
+                    }
                 }
 
                 self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
