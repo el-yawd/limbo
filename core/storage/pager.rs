@@ -1,27 +1,33 @@
-use crate::result::LimboResult;
-use crate::storage::btree::BTreePageInner;
-use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::DatabaseStorage;
-use crate::storage::header_accessor;
-use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
-use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
-use crate::types::{CursorResult, IoResult};
-use crate::Completion;
-use crate::{Buffer, Connection, LimboError, Result};
+use crate::{
+    result::LimboResult,
+    storage::{
+        btree::{btree_init_page, BTreePage, BTreePageInner},
+        buffer_pool::BufferPool,
+        database::DatabaseStorage,
+        header_accessor,
+        page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey},
+        sqlite3_ondisk::{
+            self, begin_write_btree_page, DatabaseHeader, PageContent, PageType,
+            DATABASE_HEADER_SIZE,
+        },
+        wal::{CheckpointMode, CheckpointResult, CheckpointStatus, Wal, WalFsyncStatus},
+    },
+    types::CursorResult,
+    Buffer, Completion, Connection, LimboError, Result,
+};
 use bitflags::bitflags;
 use parking_lot::RwLock;
-use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
-use std::collections::HashSet;
-use std::fmt;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::{Cell, OnceCell, RefCell, UnsafeCell},
+    collections::HashSet,
+    fmt,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+};
 use tracing::{instrument, trace, Level};
-
-use super::btree::{btree_init_page, BTreePage};
-use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
-use super::sqlite3_ondisk::{begin_write_btree_page, DATABASE_HEADER_SIZE};
-use super::wal::{CheckpointMode, CheckpointStatus};
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use {crate::io::Buffer as IoBuffer, ptrmap::*};
@@ -292,13 +298,6 @@ pub struct Pager {
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
     pub spill_flag: RefCell<SpillFlag>,
-}
-
-#[derive(Debug, Copy, Clone)]
-/// Status of the current cache flush.
-pub enum PagerCacheFlushStatus {
-    Done,
-    IO,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -854,43 +853,19 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<PagerCacheFlushStatus> {
-        let state = self.flush_info.borrow().state;
-        trace!(?state);
-        match state {
-            FlushState::Start => {
-                for page_id in self.dirty_pages.borrow().iter() {
-                    let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey(*page_id);
-                    let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                    let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                    trace!("cacheflush(page={}, page_type={:?})", page_id, page_type);
-                    self.wal.borrow_mut().append_frame(
-                        page.clone(),
-                        0,
-                        self.flush_info.borrow().in_flight_writes.clone(),
-                    )?;
-                    page.clear_dirty();
-                }
-                {
-                    let mut cache = self.page_cache.write();
-                    cache.clear().unwrap();
-                }
-                self.dirty_pages.borrow_mut().clear();
-                self.flush_info.borrow_mut().state = FlushState::WaitAppendFrames;
-                return Ok(PagerCacheFlushStatus::IO);
-            }
-            FlushState::WaitAppendFrames => {
-                let in_flight = *self.flush_info.borrow().in_flight_writes.borrow();
-                if in_flight == 0 {
-                    self.flush_info.borrow_mut().state = FlushState::Start;
-                    self.wal.borrow_mut().finish_append_frames_commit()?;
-                    return Ok(PagerCacheFlushStatus::Done);
-                } else {
-                    return Ok(PagerCacheFlushStatus::IO);
-                }
-            }
+    pub fn cacheflush(&self) -> Result<CursorResult<()>> {
+        let mut cache = self.page_cache.write();
+        let dirty_pages = self.dirty_pages.borrow();
+        let dirty_pages = dirty_pages
+                     .iter()
+                     .map(|key| cache.get(&PageCacheKey(*key)).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it."));
+
+        if let CursorResult::Ok(_) = self.stress(dirty_pages)? {
+            self.dirty_pages.borrow_mut().clear();
+            return Ok(CursorResult::Ok(()));
         }
+
+        Ok(CursorResult::IO)
     }
 
     /// Flush all dirty pages to disk.
@@ -1371,7 +1346,6 @@ impl Pager {
     where
         T: Iterator<Item = PageRef>,
     {
-        // todo: improve error handling
         if !self.spill_flag.borrow().can_spill() {
             return Err(LimboError::SpillNotAllowed(*self.spill_flag.borrow()));
         }
@@ -1406,7 +1380,7 @@ impl Pager {
             }
         }
 
-        Ok(IoResult::IO)
+        Ok(CursorResult::IO)
     }
 
     pub fn disable_cache_spill(&self, toggle: bool) {
