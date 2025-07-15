@@ -8,6 +8,7 @@ use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::Completion;
 use crate::{Buffer, Connection, LimboError, Result};
+use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -33,6 +34,38 @@ pub struct PageInner {
 #[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
+}
+
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
@@ -218,7 +251,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     wal: Rc<RefCell<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -243,6 +276,7 @@ pub struct Pager {
     /// to change it.
     page_size: Cell<Option<u32>>,
     reserved_space: OnceCell<u8>,
+    pub spill_flag: RefCell<SpillFlag>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -320,6 +354,7 @@ impl Pager {
                 state: FlushState::Start,
                 in_flight_writes: Rc::new(RefCell::new(0)),
             }),
+            spill_flag: RefCell::new(SpillFlag::empty()),
         })
     }
 
@@ -811,7 +846,7 @@ impl Pager {
             FlushState::Start => {
                 for page_id in self.dirty_pages.borrow().iter() {
                     let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey::new(*page_id);
+                    let page_key = PageCacheKey(*page_id);
                     let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                     let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                     trace!("cacheflush(page={}, page_type={:?})", page_id, page_type);
@@ -1311,6 +1346,10 @@ impl Pager {
         self.wal.borrow_mut().rollback()?;
 
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 }
 
